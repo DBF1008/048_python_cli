@@ -271,23 +271,146 @@ class LockFileError(ValueError):
     pass
 
 
-@contextmanager
-def open_with_lockfile(file: Path, *args, **kwargs) -> Generator[IO[Any], None, None]:
-    file_id = base64.b64encode(os.fsencode(file)).decode()
-    target_file = Path(tempfile.gettempdir()) / file_id
+# Lock staleness threshold: if a lock file is older than this,
+# it is considered stale (likely from a crashed process).
+_LOCK_STALE_TIMEOUT = 300  # 5 minutes
 
-    # Have an atomic-like touch here, so we'll tighten the possibility of
-    # a race occurring between multiple processes accessing the same file.
+# Retry parameters for lock acquisition
+_LOCK_MAX_RETRIES = 10
+_LOCK_RETRY_BASE_DELAY = 0.05  # 50ms
+_LOCK_RETRY_MAX_DELAY = 2.0    # 2 seconds
+
+
+def _get_lock_path(file: Path) -> Path:
+    """Return the lock file path for a given target file."""
+    file_id = base64.b64encode(os.fsencode(str(file))).decode()
+    return Path(tempfile.gettempdir()) / file_id
+
+
+def _is_lock_stale(lock_path: Path) -> bool:
+    """Check if a lock file is stale (older than _LOCK_STALE_TIMEOUT)."""
     try:
-        target_file.touch(exist_ok=False)
-    except FileExistsError as exc:
-        raise LockFileError("Can't modify a locked file.") from exc
+        lock_age = time.time() - lock_path.stat().st_mtime
+        return lock_age > _LOCK_STALE_TIMEOUT
+    except OSError:
+        # If we can't stat it, it might have been removed already
+        return True
+
+
+def _acquire_lock(lock_path: Path, retry: bool = True) -> None:
+    """Acquire a lock file with retry and stale detection.
+
+    Uses os.O_CREAT | os.O_EXCL for atomic lock creation at the OS level.
+    On contention, retries with exponential backoff. Stale locks (from
+    crashed processes) are automatically cleaned up.
+    """
+    max_retries = _LOCK_MAX_RETRIES if retry else 0
+    delay = _LOCK_RETRY_BASE_DELAY
+
+    for attempt in range(max_retries + 1):
+        try:
+            fd = os.open(
+                str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            )
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return  # Lock acquired
+        except FileExistsError:
+            # Check if the existing lock is stale
+            if _is_lock_stale(lock_path):
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass  # Another process may have already removed it
+                continue  # Retry immediately after stale removal
+
+            if attempt < max_retries:
+                time.sleep(delay)
+                delay = min(delay * 2, _LOCK_RETRY_MAX_DELAY)
+            # else: fall through to raise LockFileError
+
+    raise LockFileError(
+        f'Could not acquire lock for {lock_path} after {max_retries + 1} attempts.'
+    )
+
+
+def _release_lock(lock_path: Path) -> None:
+    """Release a lock file, ignoring errors if already removed."""
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass  # Lock may have been cleaned up by stale detection
+
+
+@contextmanager
+def open_with_lockfile(
+    file: Path, *args, retry: bool = True, **kwargs
+) -> Generator[IO[Any], None, None]:
+    """Open a file with an advisory lock file.
+
+    Uses os.O_CREAT | os.O_EXCL for atomic lock creation, retries with
+    exponential backoff on contention, and detects stale locks from
+    crashed processes.
+    """
+    lock_path = _get_lock_path(file)
+    _acquire_lock(lock_path, retry=retry)
 
     try:
         with open(file, *args, **kwargs) as stream:
             yield stream
     finally:
-        target_file.unlink()
+        _release_lock(lock_path)
+
+
+@contextmanager
+def acquire_lockfile(file: Path, retry: bool = True):
+    """Acquire a lock file for the given path without opening it.
+
+    Use this when you need to coordinate access but perform I/O
+    separately (e.g., for atomic writes via temp+rename).
+    """
+    lock_path = _get_lock_path(file)
+    _acquire_lock(lock_path, retry=retry)
+
+    try:
+        yield
+    finally:
+        _release_lock(lock_path)
+
+
+def atomic_write_json(file: Path, data: dict) -> None:
+    """Atomically write JSON data to a file.
+
+    Writes to a temporary file in the same directory, then uses
+    os.replace() to atomically rename it over the target. This
+    prevents corruption from crashes mid-write.
+    """
+    file = Path(file)
+    file.parent.mkdir(parents=True, exist_ok=True)
+
+    fd = None
+    tmp_path = None
+    try:
+        fd, tmp_path_str = tempfile.mkstemp(
+            dir=str(file.parent),
+            suffix='.tmp',
+            prefix='.version_info_',
+        )
+        tmp_path = Path(tmp_path_str)
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(data, stream)
+        fd = None  # fd is now owned by the with-block and closed
+
+        os.replace(tmp_path, file)
+        tmp_path = None  # Rename succeeded; don't clean up
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 
 def is_version_greater(version_1: str, version_2: str) -> bool:
