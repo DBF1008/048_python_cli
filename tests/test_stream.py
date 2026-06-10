@@ -27,7 +27,7 @@ class SortJSONConverterPlugin(ConverterPlugin):
         return mime == 'json/bytes'
 
     def convert(self, body):
-        body = body.lstrip(b'\x00')
+        body = body.replace(b'\x00', b'')
         data = json.loads(body)
         return 'application/json', json.dumps(data, sort_keys=True)
 
@@ -148,3 +148,64 @@ def test_streaming_encoding_detection(http_server):
     r = http('--stream', http_server + '/stream/encoding/random')
     assert ASCII_FILE_CONTENT in r
     assert UNICODE_FILE_CONTENT in r
+
+
+@pytest.mark.parametrize('pretty', PRETTY_OPTIONS)
+@pytest.mark.parametrize('stream', [True, False])
+@responses.activate
+def test_converter_with_binary_in_non_first_chunk(pretty, stream):
+    """Ensure converter is applied when \\x00 appears in a later chunk,
+    not only in the first one. This is the key regression test for
+    PrettyStream / BufferedPrettyStream semantic parity."""
+    plugin_manager.register(SortJSONConverterPlugin)
+    try:
+        # First line is clean text; second line starts with \x00.
+        # After removing \x00 the body is valid JSON: {"foo":42,\n"bar":"baz"}
+        body = b'{"foo":42,\n\x00"bar":"baz"}'
+        responses.add(responses.GET, DUMMY_URL, body=body,
+                      stream=True, content_type='json/bytes')
+
+        args = ['--pretty=' + pretty, 'GET', DUMMY_URL]
+        if stream:
+            args.insert(0, '--stream')
+        r = http(*args)
+
+        assert 'json/bytes' in r
+        if pretty == 'none':
+            # EncodedStream has no converter pipeline — binary is suppressed.
+            assert BINARY_SUPPRESSED_NOTICE.decode() in r
+        else:
+            # Converter must be applied regardless of stream mode.
+            assert '"bar": "baz",' in r
+            assert '"foo": 42' in r
+    finally:
+        plugin_manager.unregister(SortJSONConverterPlugin)
+
+
+@pytest.mark.parametrize('stream', [True, False])
+@responses.activate
+def test_stream_converter_pure_text_no_binary(stream):
+    """When a converter is registered for the MIME type but the body
+    contains no \\x00, the text should be rendered correctly in both
+    stream and buffered modes (converter is not invoked)."""
+    plugin_manager.register(SortJSONConverterPlugin)
+    try:
+        # Pure text body with no \x00 — converter should NOT be invoked,
+        # and the response should still be formatted as json/bytes
+        # (which for pretty != 'none' means the body is rendered).
+        body = b'hello world\nsecond line'
+        responses.add(responses.GET, DUMMY_URL, body=body,
+                      stream=True, content_type='json/bytes')
+
+        args = ['--pretty=all', 'GET', DUMMY_URL]
+        if stream:
+            args.insert(0, '--stream')
+        r = http(*args)
+
+        assert 'json/bytes' in r
+        assert 'hello world' in r
+        assert 'second line' in r
+        # Must NOT be suppressed
+        assert BINARY_SUPPRESSED_NOTICE.decode() not in r
+    finally:
+        plugin_manager.unregister(SortJSONConverterPlugin)

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \":*)",
+      "Bash(pip3 show:*)",
+      "Bash(pip3 install:*)",
+      "Bash(python3 -m pytest tests/test_stream.py -v -k \"converter\" --no-header --tb=long --override-ini=\"addopts=\")"
+    ]
+  }
+}

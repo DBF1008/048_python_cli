@@ -196,25 +196,43 @@ class PrettyStream(EncodedStream):
             self.msg.metadata).encode(self.output_encoding)
 
     def iter_body(self) -> Iterable[bytes]:
-        first_chunk = True
+        converter = self.conversion.get_converter(self.mime)
         iter_lines = self.msg.iter_lines(self.CHUNK_SIZE)
+        buffered = bytearray()
+
         for line, lf in iter_lines:
             if b'\0' in line:
-                if first_chunk:
-                    converter = self.conversion.get_converter(self.mime)
-                    if converter:
-                        body = bytearray()
-                        # noinspection PyAssignmentToLoopOrWithParameter
-                        for line, lf in chain([(line, lf)], iter_lines):
-                            body.extend(line)
-                            body.extend(lf)
-                        self.mime, body = converter.convert(body)
-                        assert isinstance(body, str)
-                        yield self.process_body(body)
-                        return
-                raise BinarySuppressedError()
-            yield self.process_body(line) + lf
-            first_chunk = False
+                if not converter:
+                    raise BinarySuppressedError()
+                # Binary detected with a converter available — consume the
+                # rest of the body so the converter can process it in full.
+                # This works regardless of whether binary appeared in the
+                # first chunk or a later one.
+                for remaining_line, remaining_lf in chain(
+                    [(line, lf)], iter_lines
+                ):
+                    buffered.extend(remaining_line)
+                    buffered.extend(remaining_lf)
+                self.mime, body = converter.convert(bytes(buffered))
+                assert isinstance(body, str)
+                yield self.process_body(body)
+                return
+            if converter:
+                # A converter is registered for this MIME type — buffer the
+                # content so that the converter can be applied to the full
+                # body if binary is encountered in a later chunk.
+                buffered.extend(line)
+                buffered.extend(lf)
+            else:
+                # No converter available — stream text immediately.
+                yield self.process_body(line) + lf
+
+        # Body fully consumed without encountering binary data.
+        if converter:
+            # Content was buffered; process as a whole. This is
+            # semantically equivalent to per-line streaming for text.
+            yield self.process_body(buffered)
+        # If no converter, all text was already yielded line-by-line.
 
     def process_body(self, chunk: Union[str, bytes]) -> bytes:
         if not isinstance(chunk, str):
