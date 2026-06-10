@@ -1,5 +1,4 @@
 from abc import ABCMeta, abstractmethod
-from itertools import chain
 from typing import Callable, Iterable, Optional, Union
 
 from .processing import Conversion, Formatting
@@ -196,25 +195,28 @@ class PrettyStream(EncodedStream):
             self.msg.metadata).encode(self.output_encoding)
 
     def iter_body(self) -> Iterable[bytes]:
-        first_chunk = True
-        iter_lines = self.msg.iter_lines(self.CHUNK_SIZE)
-        for line, lf in iter_lines:
+        # Check upfront whether a converter is available for this MIME.
+        # When one is, we buffer the whole body so that binary content
+        # (\0) appearing in *any* chunk — not just the first — can
+        # still be converted.  This keeps stream-mode semantics
+        # consistent with BufferedPrettyStream.
+        converter = self.conversion.get_converter(self.mime)
+        if converter:
+            body = bytearray()
+            for chunk in self.msg.iter_body(1024 * 10):
+                body.extend(chunk)
+            if b'\0' in body:
+                self.mime, body = converter.convert(body)
+                assert isinstance(body, str)
+            yield self.process_body(body)
+            return
+
+        # No converter available — stream line-by-line and suppress
+        # binary data immediately.
+        for line, lf in self.msg.iter_lines(self.CHUNK_SIZE):
             if b'\0' in line:
-                if first_chunk:
-                    converter = self.conversion.get_converter(self.mime)
-                    if converter:
-                        body = bytearray()
-                        # noinspection PyAssignmentToLoopOrWithParameter
-                        for line, lf in chain([(line, lf)], iter_lines):
-                            body.extend(line)
-                            body.extend(lf)
-                        self.mime, body = converter.convert(body)
-                        assert isinstance(body, str)
-                        yield self.process_body(body)
-                        return
                 raise BinarySuppressedError()
             yield self.process_body(line) + lf
-            first_chunk = False
 
     def process_body(self, chunk: Union[str, bytes]) -> bytes:
         if not isinstance(chunk, str):

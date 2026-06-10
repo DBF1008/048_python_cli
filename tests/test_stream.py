@@ -32,6 +32,17 @@ class SortJSONConverterPlugin(ConverterPlugin):
         return 'application/json', json.dumps(data, sort_keys=True)
 
 
+class StripNullsConverterPlugin(ConverterPlugin):
+    @classmethod
+    def supports(cls, mime):
+        return mime == 'application/x-json-with-nulls'
+
+    def convert(self, body):
+        body = body.replace(b'\x00', b'')
+        data = json.loads(body)
+        return 'application/json', json.dumps(data, sort_keys=True)
+
+
 # GET because httpbin 500s with binary POST body.
 
 
@@ -88,6 +99,29 @@ def test_pretty_options_with_and_without_stream_with_converter(pretty, stream):
             assert '"foo": 42' in r
     finally:
         plugin_manager.unregister(SortJSONConverterPlugin)
+
+
+@pytest.mark.parametrize('stream', [True, False])
+@responses.activate
+def test_pretty_stream_converter_with_late_binary(stream):
+    """Converter is used even when \\0 appears after the first chunk."""
+    plugin_manager.register(StripNullsConverterPlugin)
+    try:
+        body = b'{"foo":42,\n\x00"bar":"baz"}'
+        responses.add(responses.GET, DUMMY_URL, body=body,
+                      stream=True,
+                      content_type='application/x-json-with-nulls')
+
+        args = ['--pretty=all', 'GET', DUMMY_URL]
+        if stream:
+            args.insert(0, '--stream')
+        r = http(*args)
+
+        assert BINARY_SUPPRESSED_NOTICE.decode() not in r
+        assert '"bar": "baz"' in r
+        assert '"foo": 42' in r
+    finally:
+        plugin_manager.unregister(StripNullsConverterPlugin)
 
 
 def test_encoded_stream(httpbin):
