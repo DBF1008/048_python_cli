@@ -10,7 +10,7 @@ from requests.structures import CaseInsensitiveDict
 
 from httpie.downloads import (
     parse_content_range, filename_from_content_disposition, filename_from_url,
-    get_unique_filename, ContentRangeError, Downloader, PARTIAL_CONTENT
+    get_unique_filename, trim_filename, ContentRangeError, Downloader, PARTIAL_CONTENT
 )
 from .utils import http, MockEnvironment
 
@@ -83,15 +83,15 @@ class TestDownloadUtils:
         [
             # Simple
             ('foo.bar', 0, 'foo.bar'),
-            ('foo.bar', 1, 'foo.bar-1'),
-            ('foo.bar', 10, 'foo.bar-10'),
+            ('foo.bar', 1, 'foo-1.bar'),
+            ('foo.bar', 10, 'foo-10.bar'),
             # Trim
             ('A' * 20, 0, 'A' * 10),
             ('A' * 20, 1, 'A' * 8 + '-1'),
             ('A' * 20, 10, 'A' * 7 + '-10'),
             # Trim before ext
             ('A' * 20 + '.txt', 0, 'A' * 6 + '.txt'),
-            ('A' * 20 + '.txt', 1, 'A' * 4 + '.txt-1'),
+            ('A' * 20 + '.txt', 1, 'A' * 4 + '-1' + '.txt'),
             # Trim at the end
             ('foo.' + 'A' * 20, 0, 'foo.' + 'A' * 6),
             ('foo.' + 'A' * 20, 1, 'foo.' + 'A' * 4 + '-1'),
@@ -116,6 +116,60 @@ class TestDownloadUtils:
 
         get_filename_max_length.return_value = 10
 
+        actual = get_unique_filename(orig_name, attempts(unique_on_attempt))
+        assert expected == actual
+
+    def test_Content_Range_parsing_whitespace(self):
+        parse = parse_content_range
+        assert parse('bytes 100-199/200 ', 100) == 200
+        assert parse(' bytes 100-199/200', 100) == 200
+        assert parse(' bytes 100-199/200 ', 100) == 200
+        assert parse('bytes  100-199/200', 100) == 200
+        assert parse('bytes   100-199/200', 100) == 200
+        assert parse('bytes\t100-199/200', 100) == 200
+
+    def test_trim_filename_edge_cases(self):
+        # Short name, long extension: trim extension
+        result = trim_filename('ab.' + 'A' * 22, 10)
+        assert result == 'ab.' + 'A' * 7
+        assert len(result) == 10
+
+        # Extremely short max_len: drop extension entirely
+        result = trim_filename('ab.AAAAAA', 1)
+        assert result == 'a'
+        assert len(result) == 1
+
+        # No extension
+        assert trim_filename('A' * 20, 10) == 'A' * 10
+        assert trim_filename('A' * 20, 5) == 'A' * 5
+
+        # Normal case: trim name, preserve extension
+        assert trim_filename('A' * 20 + '.txt', 10) == 'A' * 6 + '.txt'
+
+    @pytest.mark.parametrize(
+        'orig_name, unique_on_attempt, expected',
+        [
+            ('archive.tar.gz', 1, 'archive.tar-1.gz'),
+            ('archive.tar.gz', 10, 'archive.tar-10.gz'),
+            ('README', 1, 'README-1'),
+            ('.hidden', 1, '.hidden-1'),
+        ]
+    )
+    @mock.patch('httpie.downloads.get_filename_max_length')
+    def test_unique_filename_suffix_before_extension(
+        self, get_filename_max_length,
+        orig_name, unique_on_attempt, expected
+    ):
+        def attempts(unique_on_attempt=0):
+            def exists(filename):
+                if exists.attempt == unique_on_attempt:
+                    return False
+                exists.attempt += 1
+                return True
+            exists.attempt = 0
+            return exists
+
+        get_filename_max_length.return_value = 255
         actual = get_unique_filename(orig_name, attempts(unique_on_attempt))
         assert expected == actual
 
@@ -259,3 +313,76 @@ class TestDownloads:
                 assert os.listdir('.') == [expected_filename]
             finally:
                 os.chdir(orig_cwd)
+
+    def test_download_resume_invalid_content_range_fallback(
+        self, mock_env, httpbin_both
+    ):
+        """206 + invalid Content-Range should fall back, not crash."""
+        with tempfile.TemporaryDirectory() as tmp_dirname:
+            file = os.path.join(tmp_dirname, 'file.bin')
+            with open(file, 'wb') as fh:
+                fh.write(b'123')
+
+            with open(file, 'a+b') as output_file:
+                downloader = Downloader(
+                    mock_env, output_file=output_file, resume=True
+                )
+                headers = {}
+                downloader.pre_request(headers)
+                assert downloader._resumed_from == 3
+
+                downloader.start(
+                    final_response=Response(
+                        url=httpbin_both.url + '/',
+                        headers={
+                            'Content-Length': 10,
+                            'Content-Range': 'invalid-range-header',
+                        },
+                        status_code=PARTIAL_CONTENT
+                    ),
+                    initial_url='/'
+                )
+
+                # Should have fallen back to fresh download
+                assert downloader._resumed_from == 0
+                assert downloader.status.total_size is None
+                output_file.seek(0, 2)
+                assert output_file.tell() == 0
+
+                downloader.chunk_downloaded(b'0123456789')
+                downloader.finish()
+                downloader.failed()
+                assert not downloader.interrupted
+
+    def test_download_resume_206_no_content_range_header(
+        self, mock_env, httpbin_both
+    ):
+        """206 + missing Content-Range header should fall back gracefully."""
+        with tempfile.TemporaryDirectory() as tmp_dirname:
+            file = os.path.join(tmp_dirname, 'file.bin')
+            with open(file, 'wb') as fh:
+                fh.write(b'partial')
+
+            with open(file, 'a+b') as output_file:
+                downloader = Downloader(
+                    mock_env, output_file=output_file, resume=True
+                )
+                headers = {}
+                downloader.pre_request(headers)
+
+                downloader.start(
+                    final_response=Response(
+                        url=httpbin_both.url + '/',
+                        headers={'Content-Length': 5},
+                        status_code=PARTIAL_CONTENT
+                    ),
+                    initial_url='/'
+                )
+
+                assert downloader._resumed_from == 0
+                assert downloader.status.total_size is None
+
+                downloader.chunk_downloaded(b'12345')
+                downloader.finish()
+                downloader.failed()
+                assert not downloader.interrupted

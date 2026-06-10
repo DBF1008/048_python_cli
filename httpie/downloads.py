@@ -14,7 +14,7 @@ import requests
 
 from .models import HTTPResponse, OutputOptions
 from .output.streams import RawStream
-from .context import Environment
+from .context import Environment, LogLevel
 
 
 PARTIAL_CONTENT = 206
@@ -39,8 +39,10 @@ def parse_content_range(content_range: str, resumed_from: int) -> int:
     if content_range is None:
         raise ContentRangeError('Missing Content-Range')
 
+    content_range = content_range.strip()
+
     pattern = (
-        r'^bytes (?P<first_byte_pos>\d+)-(?P<last_byte_pos>\d+)'
+        r'^bytes\s+(?P<first_byte_pos>\d+)-(?P<last_byte_pos>\d+)'
         r'/(\*|(?P<instance_length>\d+))$'
     )
     match = re.match(pattern, content_range)
@@ -128,7 +130,14 @@ def trim_filename(filename: str, max_len: int) -> str:
         trim_by = len(filename) - max_len
         name, ext = os.path.splitext(filename)
         if trim_by >= len(name):
-            filename = filename[:-trim_by]
+            # Name alone can't absorb all the trimming.
+            if trim_by < len(ext):
+                # Trim the extension, keep the name intact.
+                filename = name + ext[:-trim_by]
+            else:
+                # Both name and extension need trimming;
+                # keep only the first max_len chars of name.
+                filename = name[:max_len]
         else:
             filename = name[:-trim_by] + ext
     return filename
@@ -150,10 +159,23 @@ def trim_filename_if_needed(filename: str, directory='.', extra=0) -> str:
 
 def get_unique_filename(filename: str, exists=os.path.exists) -> str:
     attempt = 0
+    name, ext = os.path.splitext(filename)
     while True:
         suffix = f'-{attempt}' if attempt > 0 else ''
-        try_filename = trim_filename_if_needed(filename, extra=len(suffix))
-        try_filename += suffix
+        max_len = get_filename_max_length('.') - len(suffix)
+        if ext and len(ext) >= max_len:
+            # Extension alone fills/exceeds max length.
+            # Fall back: trim the full filename, append suffix after.
+            try_filename = trim_filename_if_needed(
+                filename, extra=len(suffix)
+            )
+            try_filename += suffix
+        else:
+            # Normal path: trim name, insert suffix before extension.
+            name_trimmed = trim_filename_if_needed(
+                name, extra=len(suffix) + len(ext)
+            )
+            try_filename = name_trimmed + suffix + ext
         if not exists(try_filename):
             return try_filename
         attempt += 1
@@ -178,6 +200,7 @@ class Downloader:
 
         """
         self.finished = False
+        self._env = env
         self.status = DownloadStatus(env=env)
         self._output_file = output_file
         self._resume = resume
@@ -231,10 +254,25 @@ class Downloader:
         else:
             # `--output, -o` provided
             if self._resume and final_response.status_code == PARTIAL_CONTENT:
-                total_size = parse_content_range(
-                    final_response.headers.get('Content-Range'),
-                    self._resumed_from
-                )
+                try:
+                    total_size = parse_content_range(
+                        final_response.headers.get('Content-Range'),
+                        self._resumed_from
+                    )
+                except ContentRangeError as e:
+                    # Server returned 206 but Content-Range is invalid.
+                    # Fall back to a fresh download.
+                    self._env.log_error(
+                        f'Invalid Content-Range, restarting download: {e}',
+                        level=LogLevel.WARNING
+                    )
+                    self._resumed_from = 0
+                    total_size = None
+                    try:
+                        self._output_file.seek(0)
+                        self._output_file.truncate()
+                    except OSError:
+                        pass  # stdout
 
             else:
                 self._resumed_from = 0
