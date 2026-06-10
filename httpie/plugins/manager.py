@@ -26,16 +26,24 @@ ENTRY_POINT_NAMES = list(ENTRY_POINT_CLASSES.keys())
 
 @contextmanager
 def _load_directories(site_dirs: Iterable[Path]) -> Iterator[None]:
-    plugin_dirs = [
+    # Take a snapshot of sys.path so we can restore it exactly on exit.
+    # This avoids corrupting sys.path when:
+    #   - a plugin dir was already present before entering the context
+    #   - nested contexts add/remove the same dirs
+    #   - get_site_paths yields duplicate paths
+    original_sys_path = sys.path.copy()
+    plugin_dirs = {
         os.fspath(site_dir)
         for site_dir in site_dirs
-    ]
-    sys.path.extend(plugin_dirs)
+    }
+    # Only add dirs that are not already in sys.path to avoid duplicates.
+    for plugin_dir in plugin_dirs:
+        if plugin_dir not in sys.path:
+            sys.path.append(plugin_dir)
     try:
         yield
     finally:
-        for plugin_dir in plugin_dirs:
-            sys.path.remove(plugin_dir)
+        sys.path[:] = original_sys_path
 
 
 def enable_plugins(plugins_dir: Optional[Path]) -> ContextManager[None]:
@@ -60,21 +68,36 @@ class PluginManager(list):
         with enable_plugins(directory):
             eps = importlib_metadata.entry_points()
 
+            seen = set()
             for entry_point_name in ENTRY_POINT_NAMES:
-                yield from find_entry_points(eps, group=entry_point_name)
+                for ep in find_entry_points(eps, group=entry_point_name):
+                    # Deduplicate entry points by (group, name) to ensure
+                    # deterministic, stable results even when duplicate
+                    # metadata is present (e.g. leftover .dist-info dirs).
+                    key = (ep.group, ep.name)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    yield ep
 
     def load_installed_plugins(self, directory: Optional[Path] = None):
         for entry_point in self.iter_entry_points(directory):
             plugin_name = get_dist_name(entry_point)
+            ep_label = f'{plugin_name or entry_point.name} [{entry_point.group}]'
             try:
                 plugin = entry_point.load()
             except BaseException as exc:
                 warnings.warn(
-                    f'While loading "{plugin_name}", an error occurred: {exc}\n'
-                    f'For uninstallations, please use either "httpie plugins uninstall {plugin_name}" '
-                    f'or "pip uninstall {plugin_name}" (depending on how you installed it in the first '
+                    f'While loading "{ep_label}", an error occurred: {exc}\n'
+                    f'For uninstallations, please use either "httpie plugins uninstall {plugin_name or entry_point.name}" '
+                    f'or "pip uninstall {plugin_name or entry_point.name}" (depending on how you installed it in the first '
                     'place).'
                 )
+                continue
+            # Skip plugins that are already registered (e.g. from a previous
+            # call to load_installed_plugins, or because two entry points
+            # resolved to the same class).
+            if plugin in self:
                 continue
             plugin.package_name = plugin_name
             self.register(plugin)
