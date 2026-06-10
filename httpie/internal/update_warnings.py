@@ -10,7 +10,7 @@ import httpie
 from httpie.context import Environment, LogLevel
 from httpie.internal.__build_channel__ import BUILD_CHANNEL
 from httpie.internal.daemons import spawn_daemon
-from httpie.utils import is_version_greater, open_with_lockfile
+from httpie.utils import is_version_greater, open_with_lockfile, LockFileError
 
 # Automatically updated package version index.
 PACKAGE_INDEX_LINK = 'https://packages.httpie.io/latest.json'
@@ -28,11 +28,14 @@ You are already up-to-date.
 """
 
 
-def _read_data_error_free(file: Path) -> Any:
-    # If the file is broken / non-existent, ignore it.
+def _read_data_error_free(file: Path) -> dict:
+    # If the file is broken / non-existent / half-written, ignore it.
     try:
         with open(file) as stream:
-            return json.load(stream)
+            data = json.load(stream)
+        if not isinstance(data, dict):
+            return {}
+        return data
     except (ValueError, OSError):
         return {}
 
@@ -48,8 +51,12 @@ def _fetch_updates(env: Environment) -> str:
     data['last_fetched_date'] = datetime.now().isoformat()
     data['last_released_versions'] = response.json()
 
-    with open_with_lockfile(file, 'w') as stream:
-        json.dump(data, stream)
+    try:
+        with open_with_lockfile(file, 'w') as stream:
+            json.dump(data, stream)
+    except LockFileError:
+        # Another process holds the lock; skip this write.
+        pass
 
 
 def fetch_updates(env: Environment, lazy: bool = True):
@@ -66,11 +73,16 @@ def maybe_fetch_updates(env: Environment) -> None:
     data = _read_data_error_free(env.config.version_info_file)
 
     if data:
-        current_date = datetime.now()
-        last_fetched_date = datetime.fromisoformat(data['last_fetched_date'])
-        earliest_fetch_date = last_fetched_date + FETCH_INTERVAL
-        if current_date < earliest_fetch_date:
-            return None
+        last_fetched_date = data.get('last_fetched_date')
+        if last_fetched_date is not None:
+            try:
+                current_date = datetime.now()
+                earliest_fetch_date = datetime.fromisoformat(last_fetched_date) + FETCH_INTERVAL
+                if current_date < earliest_fetch_date:
+                    return None
+            except (ValueError, TypeError):
+                # Corrupted date — proceed to re-fetch.
+                pass
 
     fetch_updates(env)
 
@@ -112,17 +124,22 @@ def _get_update_status(env: Environment) -> Optional[str]:
         return None
 
     with _get_suppress_context(env):
-        # If the user quickly spawns multiple httpie processes
-        # we don't want to end in a race.
-        with open_with_lockfile(file) as stream:
-            version_info = json.load(stream)
+        version_info = _read_data_error_free(file)
+        if not version_info:
+            return None
 
-        available_channels = version_info['last_released_versions']
+        available_channels = version_info.get('last_released_versions')
+        if not isinstance(available_channels, dict):
+            return None
+
         if BUILD_CHANNEL not in available_channels:
             return None
 
         current_version = httpie.__version__
         last_released_version = available_channels[BUILD_CHANNEL]
+        if not isinstance(last_released_version, str):
+            return None
+
         if not is_version_greater(last_released_version, current_version):
             return None
 
@@ -148,24 +165,30 @@ def check_updates(env: Environment) -> None:
     if not update_status:
         return None
 
-    # If the user quickly spawns multiple httpie processes
-    # we don't want to end in a race.
-    with open_with_lockfile(file) as stream:
-        version_info = json.load(stream)
+    version_info = _read_data_error_free(file)
 
     # We don't want to spam the user with too many warnings,
-    # so we'll only warn every once a while (WARN_INTERNAL).
+    # so we'll only warn every once a while (WARN_INTERVAL).
     current_date = datetime.now()
-    last_warned_date = version_info['last_warned_date']
+    last_warned_date = version_info.get('last_warned_date')
     if last_warned_date is not None:
-        earliest_warn_date = (
-            datetime.fromisoformat(last_warned_date) + WARN_INTERVAL
-        )
-        if current_date < earliest_warn_date:
-            return None
+        try:
+            earliest_warn_date = (
+                datetime.fromisoformat(last_warned_date) + WARN_INTERVAL
+            )
+            if current_date < earliest_warn_date:
+                return None
+        except (ValueError, TypeError):
+            # Corrupted date — allow warning to proceed.
+            pass
 
     env.log_error(update_status, level=LogLevel.INFO)
     version_info['last_warned_date'] = current_date.isoformat()
 
-    with open_with_lockfile(file, 'w') as stream:
-        json.dump(version_info, stream)
+    try:
+        with open_with_lockfile(file, 'w') as stream:
+            json.dump(version_info, stream)
+    except LockFileError:
+        # Another process holds the lock; skip persisting the warn date.
+        # The warning was already shown; worst case we warn again next run.
+        pass
