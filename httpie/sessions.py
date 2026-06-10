@@ -180,7 +180,27 @@ class Session(BaseConfigDict):
 
             importer(normalized_values)
 
+        # Move any Cookie headers loaded from the session file into the
+        # cookie jar so they don't also persist as headers (which would
+        # cause headers and cookies to overwrite each other on save).
+        self._move_cookies_from_headers()
+
         return data
+
+    def _move_cookies_from_headers(self) -> None:
+        """Extract Cookie headers from _headers and add them to cookie_jar."""
+        try:
+            cookie_values = self._headers.popall('Cookie')
+        except KeyError:
+            return
+
+        for value in cookie_values:
+            if type(value) is not str:
+                value = value.decode()
+            for cookie_name, morsel in SimpleCookie(value).items():
+                if not morsel['path']:
+                    morsel['path'] = DEFAULT_COOKIE_PATH
+                self.cookie_jar.set(cookie_name, morsel)
 
     def post_process_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         for key, store, serializer, exporter in [
@@ -194,6 +214,18 @@ class Session(BaseConfigDict):
                 values,
                 original_type=original_type
             )
+
+        # Normalize auth: prevent old-style (username/password) and
+        # new-style (raw_auth) fields from coexisting in the output.
+        auth = data.get('auth')
+        if auth:
+            if auth.get('type') is None:
+                # No auth configured — keep the canonical empty form.
+                auth.pop('raw_auth', None)
+            elif 'raw_auth' in auth:
+                # New format wins — strip legacy fields.
+                auth.pop('username', None)
+                auth.pop('password', None)
 
         return data
 
@@ -243,6 +275,13 @@ class Session(BaseConfigDict):
             if key in new_keys:
                 continue
 
+            # Also filter request-level headers from old session data
+            # that should never have been persisted.
+            if key.lower() == 'cookie':
+                continue
+            if any(key.lower().startswith(prefix.lower()) for prefix in SESSION_IGNORED_HEADER_PREFIXES):
+                continue
+
             new_headers.add(key, value)
 
         self._headers = new_headers
@@ -258,7 +297,20 @@ class Session(BaseConfigDict):
 
     @cookies.setter
     def cookies(self, jar: RequestsCookieJar):
+        # Preserve is_explicit_none markers from the old jar so that
+        # domain=null cookies survive a round-trip through requests.Session.
+        explicit_none_keys = set()
+        for cookie in self.cookie_jar:
+            if cookie._rest.get('is_explicit_none'):
+                explicit_none_keys.add((cookie.name, cookie.domain, cookie.path))
+
         self.cookie_jar = jar
+
+        # Restore the markers on matching cookies in the new jar.
+        if explicit_none_keys:
+            for cookie in self.cookie_jar:
+                if (cookie.name, cookie.domain, cookie.path) in explicit_none_keys:
+                    cookie._rest['is_explicit_none'] = True
 
     def remove_cookies(self, cookies: List[Dict[str, str]]):
         for cookie in cookies:

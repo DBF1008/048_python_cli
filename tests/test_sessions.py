@@ -850,3 +850,245 @@ def test_secure_cookies_on_localhost(mock_env, tmp_path, server, expected_cookie
         server + '/cookies'
     )
     assert r.json == {'cookies': expected_cookies}
+
+
+# ────────────────────────────────────────────────────────────────────
+# Regression tests for session load / migrate / save semantics
+# ────────────────────────────────────────────────────────────────────
+
+@pytest.fixture
+def empty_session(tmp_path):
+    """A minimal session file that doesn't require httpbin."""
+    session_path = tmp_path / 'session.json'
+    session_path.write_text(json.dumps({
+        'headers': [],
+        'cookies': [],
+        'auth': {'type': None, 'username': None, 'password': None},
+    }), encoding=UTF8)
+    return session_path
+
+
+class TestCookieHeaderMovedToJar:
+    """Cookie: headers stored in the session file must be moved to the
+    cookie jar on load so they don't persist as headers *and* cookies."""
+
+    @pytest.mark.parametrize('headers_format', [
+        # Old-style dict
+        {'Cookie': 'foo=bar; baz=qux', 'X-Custom': 'keep'},
+        # New-style list
+        [
+            {'name': 'Cookie', 'value': 'foo=bar; baz=qux'},
+            {'name': 'X-Custom', 'value': 'keep'},
+        ],
+    ])
+    def test_cookie_header_moved_to_jar_on_load(self, empty_session, mock_env, headers_format):
+        with open_raw_session(empty_session) as raw_session:
+            raw_session['headers'] = headers_format
+
+        with open_session(empty_session, mock_env, read_only=True) as session:
+            # Cookie header must NOT be in _headers
+            header_names = [n.lower() for n, _ in session._headers.items()]
+            assert 'cookie' not in header_names
+
+            # Other headers must still be there
+            assert session._headers.get('X-Custom') == 'keep'
+
+            # Cookies must be in the jar
+            cookie_names = {c.name for c in session.cookie_jar}
+            assert 'foo' in cookie_names
+            assert 'baz' in cookie_names
+
+    def test_cookie_header_not_written_back(self, empty_session, mock_env):
+        """After loading a session with Cookie in headers, saving it
+        should not write Cookie back into the headers section."""
+        with open_raw_session(empty_session) as raw_session:
+            raw_session['headers'] = [
+                {'name': 'Cookie', 'value': 'tok=abc'},
+                {'name': 'X-Keep', 'value': 'yes'},
+            ]
+
+        with open_session(empty_session, mock_env):
+            pass  # load + save
+
+        with open_raw_session(empty_session, read_only=True) as raw_session:
+            saved_headers = raw_session['headers']
+            header_names = [h['name'].lower() for h in saved_headers]
+            assert 'cookie' not in header_names
+            assert 'x-keep' in header_names
+
+
+class TestRequestLevelHeaderFiltering:
+    """Content-* / If-* headers must not survive in the session even if
+    they were already persisted in an older file."""
+
+    def test_content_type_stripped_from_old_session(self, empty_session, mock_env):
+        with open_raw_session(empty_session) as raw_session:
+            raw_session['headers'] = {
+                'Content-Type': 'application/xml',
+                'X-Custom': 'keep',
+            }
+
+        with open_session(empty_session, mock_env) as session:
+            # Simulate update_headers being called (as in collect_messages)
+            from httpie.cli.dicts import HTTPHeadersDict
+            request_headers = HTTPHeadersDict()
+            request_headers.add('X-New', 'value')
+            session.update_headers(request_headers)
+
+        with open_raw_session(empty_session, read_only=True) as raw_session:
+            saved = raw_session['headers']
+            if isinstance(saved, dict):
+                names = {k.lower() for k in saved}
+            else:
+                names = {h['name'].lower() for h in saved}
+            assert 'content-type' not in names
+            assert 'x-custom' in names
+            assert 'x-new' in names
+
+    def test_if_modified_stripped_from_old_session(self, empty_session, mock_env):
+        with open_raw_session(empty_session) as raw_session:
+            raw_session['headers'] = [
+                {'name': 'If-Modified-Since', 'value': 'Thu, 01 Jan 2020 00:00:00 GMT'},
+                {'name': 'Accept', 'value': 'text/html'},
+            ]
+
+        with open_session(empty_session, mock_env) as session:
+            from httpie.cli.dicts import HTTPHeadersDict
+            session.update_headers(HTTPHeadersDict())
+
+        with open_raw_session(empty_session, read_only=True) as raw_session:
+            names = [h['name'].lower() for h in raw_session['headers']]
+            assert 'if-modified-since' not in names
+            assert 'accept' in names
+
+
+class TestNullDomainCookieRoundtrip:
+    """Cookies with domain=null must survive save->load->save cycles
+    without drifting to domain=""."""
+
+    def test_null_domain_roundtrip_via_session(self, empty_session, mock_env):
+        with open_raw_session(empty_session) as raw_session:
+            raw_session['cookies'] = [
+                {
+                    'name': 'tok',
+                    'value': 'abc',
+                    'domain': None,
+                    'path': '/',
+                    'secure': False,
+                    'expires': None,
+                },
+            ]
+
+        # Load and save
+        with open_session(empty_session, mock_env):
+            pass
+
+        # Verify domain is still null
+        with open_raw_session(empty_session, read_only=True) as raw_session:
+            cookies = raw_session['cookies']
+            assert isinstance(cookies, list)
+            tok = [c for c in cookies if c['name'] == 'tok'][0]
+            assert tok['domain'] is None
+
+    def test_null_domain_survives_jar_swap(self, empty_session, mock_env):
+        """Replacing the cookie jar (as collect_messages does) must
+        preserve is_explicit_none markers."""
+        from requests.cookies import RequestsCookieJar
+
+        with open_raw_session(empty_session) as raw_session:
+            raw_session['cookies'] = [
+                {
+                    'name': 'tok',
+                    'value': 'abc',
+                    'domain': None,
+                    'path': '/',
+                    'secure': False,
+                    'expires': None,
+                },
+            ]
+
+        with open_session(empty_session, mock_env) as session:
+            # Simulate what collect_messages does: swap the jar
+            new_jar = RequestsCookieJar()
+            for cookie in session.cookie_jar:
+                new_jar.set_cookie(cookie)
+            session.cookies = new_jar
+
+        with open_raw_session(empty_session, read_only=True) as raw_session:
+            tok = [c for c in raw_session['cookies'] if c['name'] == 'tok'][0]
+            assert tok['domain'] is None
+
+    def test_null_domain_multiple_cookies_mixed(self, empty_session, mock_env):
+        """Only domain=null cookies should get the marker; regular
+        cookies must keep their domain."""
+        with open_raw_session(empty_session) as raw_session:
+            raw_session['cookies'] = [
+                {'name': 'a', 'value': '1', 'domain': None, 'path': '/'},
+                {'name': 'b', 'value': '2', 'domain': '.example.com', 'path': '/'},
+            ]
+
+        with open_session(empty_session, mock_env):
+            pass
+
+        with open_raw_session(empty_session, read_only=True) as raw_session:
+            cookies = {c['name']: c for c in raw_session['cookies']}
+            assert cookies['a']['domain'] is None
+            assert cookies['b']['domain'] == '.example.com'
+
+
+class TestAuthFormatNormalization:
+    """Auth must not have both raw_auth and username/password after save."""
+
+    def test_raw_auth_strips_legacy_fields(self, empty_session, mock_env):
+        with open_raw_session(empty_session) as raw_session:
+            raw_session['auth'] = {
+                'type': 'basic',
+                'raw_auth': 'user:pass',
+                'username': 'user',
+                'password': 'pass',
+            }
+
+        with open_session(empty_session, mock_env):
+            pass  # load + save
+
+        with open_raw_session(empty_session, read_only=True) as raw_session:
+            auth = raw_session['auth']
+            assert auth['type'] == 'basic'
+            assert auth['raw_auth'] == 'user:pass'
+            assert 'username' not in auth
+            assert 'password' not in auth
+
+    def test_legacy_auth_preserved_without_raw_auth(self, empty_session, mock_env):
+        with open_raw_session(empty_session) as raw_session:
+            raw_session['auth'] = {
+                'type': 'basic',
+                'username': 'user',
+                'password': 'pass',
+            }
+
+        with open_session(empty_session, mock_env):
+            pass
+
+        with open_raw_session(empty_session, read_only=True) as raw_session:
+            auth = raw_session['auth']
+            assert auth['type'] == 'basic'
+            assert auth['username'] == 'user'
+            assert auth['password'] == 'pass'
+            assert 'raw_auth' not in auth
+
+    def test_empty_auth_stays_clean(self, empty_session, mock_env):
+        with open_raw_session(empty_session) as raw_session:
+            raw_session['auth'] = {
+                'type': None,
+                'username': None,
+                'password': None,
+                'raw_auth': 'stale',
+            }
+
+        with open_session(empty_session, mock_env):
+            pass
+
+        with open_raw_session(empty_session, read_only=True) as raw_session:
+            auth = raw_session['auth']
+            assert auth['type'] is None
+            assert 'raw_auth' not in auth
