@@ -581,3 +581,101 @@ def test_nested_json_errors(input_json, expected_error, httpbin):
 def test_nested_json_sparse_array(httpbin_both):
     r = http(httpbin_both + '/post', 'test[0]:=1', 'test[100]:=1')
     assert len(r.json['json']['test']) == 101
+
+
+def test_nested_json_preserves_field_order(httpbin):
+    r = http(
+        httpbin + '/post',
+        'z_last=1',
+        'a_first=2',
+        'm_middle=3',
+    )
+    assert r.json['json'] == {'z_last': '1', 'a_first': '2', 'm_middle': '3'}
+
+
+def test_nested_json_preserves_deep_field_order(httpbin):
+    r = http(
+        httpbin + '/post',
+        'obj[z]=1',
+        'obj[a]=2',
+        'obj[m]=3',
+    )
+    assert r.json['json'] == {'obj': {'z': '1', 'a': '2', 'm': '3'}}
+
+
+def test_nested_json_mixed_separators_preserve_order(httpbin):
+    r = http(
+        httpbin + '/post',
+        'first=string_val',
+        'second:=42',
+        'third=another_string',
+        'fourth:=true',
+    )
+    assert r.json['json'] == {
+        'first': 'string_val',
+        'second': 42,
+        'third': 'another_string',
+        'fourth': True,
+    }
+
+
+def test_nested_json_duplicate_key_last_writer_wins(httpbin):
+    r = http(
+        httpbin + '/post',
+        'key=first',
+        'key=second',
+    )
+    assert r.json['json']['key'] == 'second'
+
+
+def test_form_duplicate_key_multi_value(httpbin):
+    r = http(
+        '--form',
+        httpbin + '/post',
+        'key=first',
+        'key=second',
+    )
+    assert r.json['form'] == {'key': ['first', 'second']}
+
+
+def test_nested_json_mixed_raw_and_string_on_nested_path(httpbin):
+    r = http(
+        httpbin + '/post',
+        'parent[str_child]=hello',
+        'parent[int_child]:=42',
+        'parent[bool_child]:=true',
+    )
+    assert r.json['json'] == {
+        'parent': {
+            'str_child': 'hello',
+            'int_child': 42,
+            'bool_child': True,
+        }
+    }
+
+
+def test_nested_json_escaped_brackets_with_nested(httpbin):
+    r = http(
+        httpbin + '/post',
+        r'literal\[key\]=flat_value',
+        'nested[child]=nested_value',
+    )
+    assert r.json['json'] == {
+        'literal[key]': 'flat_value',
+        'nested': {'child': 'nested_value'},
+    }
+
+
+def test_nested_json_file_embed_mixed(httpbin):
+    r = http(
+        httpbin + '/post',
+        'plain=hello',
+        f'from_file=@{FILE_PATH}',
+        'raw:=42',
+        f'json_file:=@{JSON_FILE_PATH}',
+    )
+    data = r.json['json']
+    assert data['plain'] == 'hello'
+    assert data['from_file'] == FILE_CONTENT
+    assert data['raw'] == 42
+    assert data['json_file'] == json.loads(JSON_FILE_CONTENT)

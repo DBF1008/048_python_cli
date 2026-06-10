@@ -1,5 +1,6 @@
 """CLI argument parsing related tests."""
 import argparse
+from collections import OrderedDict
 
 import pytest
 from requests.exceptions import InvalidSchema
@@ -8,6 +9,7 @@ import httpie.cli.argparser
 from httpie.cli import constants
 from httpie.cli.definition import parser
 from httpie.cli.argtypes import KeyValueArg, KeyValueArgType
+from httpie.cli.nested_json import interpret_nested_json
 from httpie.cli.requestitems import RequestItems
 from httpie.status import ExitStatus
 from httpie.utils import load_json_preserve_order_and_dupe_keys
@@ -147,6 +149,34 @@ class TestItemParsing:
             ('text_field', 'a'),
             ('text_field', 'b'),
         ]
+
+    def test_mixed_separator_field_order_json_mode(self):
+        items = RequestItems.from_args([
+            self.key_value_arg('z_field=string'),
+            self.key_value_arg('a_field:=123'),
+            self.key_value_arg('m_field=another'),
+        ])
+        keys = list(items.data.keys())
+        assert keys == ['z_field', 'a_field', 'm_field']
+        assert items.data['a_field'] == 123
+
+    def test_interpret_nested_json_returns_ordered_dict(self):
+        result = interpret_nested_json([
+            ('z', '1'),
+            ('a', '2'),
+            ('m', '3'),
+        ])
+        assert isinstance(result, OrderedDict)
+        assert list(result.keys()) == ['z', 'a', 'm']
+
+    def test_interpret_nested_json_nested_containers_are_ordered(self):
+        result = interpret_nested_json([
+            ('obj[z]', '1'),
+            ('obj[a]', '2'),
+            ('obj[m]', '3'),
+        ])
+        assert isinstance(result['obj'], OrderedDict)
+        assert list(result['obj'].keys()) == ['z', 'a', 'm']
 
 
 class TestQuerystring:

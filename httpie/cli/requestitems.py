@@ -73,10 +73,6 @@ class RequestItems:
                 process_data_embed_file_contents_arg,
                 instance.data,
             ),
-            SEPARATOR_GROUP_NESTED_JSON_ITEMS: (
-                process_data_nested_json_embed_args,
-                instance.data,
-            ),
             SEPARATOR_DATA_RAW_JSON: (
                 convert_json_value_to_form_if_needed(
                     in_json_mode=instance.is_json,
@@ -100,9 +96,10 @@ class RequestItems:
             )
             if json_item_args:
                 pairs = [(arg.key, rules[arg.sep][0](arg)) for arg in json_item_args]
-                processor_func, target_dict = rules[SEPARATOR_GROUP_NESTED_JSON_ITEMS]
-                value = processor_func(pairs)
-                target_dict.update(value)
+                assert not instance.data, (
+                    'Expected empty data dict before nested JSON merge'
+                )
+                instance.data.update(interpret_nested_json(pairs))
 
         # Then handle all other items.
         for arg in request_item_args:
@@ -203,10 +200,6 @@ def process_data_embed_raw_json_file_arg(arg: KeyValueArg) -> JSONType:
 def process_data_raw_json_embed_arg(arg: KeyValueArg) -> JSONType:
     value = load_json(arg, arg.value)
     return value
-
-
-def process_data_nested_json_embed_args(pairs) -> Dict[str, JSONType]:
-    return interpret_nested_json(pairs)
 
 
 def load_text_file(item: KeyValueArg) -> str:

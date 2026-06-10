@@ -1,3 +1,4 @@
+from collections import OrderedDict
 from typing import Type, Union, Any, Iterable, Tuple
 
 from .parse import parse, assert_cant_happen
@@ -44,7 +45,10 @@ def interpret(context: Any, key: str, value: Any) -> Any:
                 )
             else:
                 pseudo_token = None
-            cursor_type = JSON_TYPE_MAPPING.get(type(cursor), type(cursor).__name__)
+            cursor_type = next(
+                (name for typ, name in JSON_TYPE_MAPPING.items() if isinstance(cursor, typ)),
+                type(cursor).__name__
+            )
             required_type = JSON_TYPE_MAPPING[expected_type]
             message = f'Cannot perform {path.kind.to_string()!r} based access on '
             message += repr(''.join(path.reconstruct() for path in paths[:index]))
@@ -59,7 +63,7 @@ def interpret(context: Any, key: str, value: Any) -> Any:
 
     def object_for(kind: PathAction) -> Any:
         if kind is PathAction.KEY:
-            return {}
+            return OrderedDict()
         elif kind in {PathAction.INDEX, PathAction.APPEND}:
             return []
         else:
@@ -106,11 +110,11 @@ def interpret(context: Any, key: str, value: Any) -> Any:
 
 def wrap_with_dict(context):
     if context is None:
-        return {}
+        return OrderedDict()
     elif isinstance(context, list):
-        return {
+        return OrderedDict({
             EMPTY_STRING: NestedJSONArray(context),
-        }
+        })
     else:
         assert isinstance(context, dict)
         return context
