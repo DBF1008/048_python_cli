@@ -29,10 +29,23 @@ class TestDownloadUtils:
         parse = parse_content_range
 
         assert parse('bytes 100-199/200', 100) == 200
-        assert parse('bytes 100-199/*', 100) == 200
+        assert parse('bytes 100-199/*', 100) is None
 
         # single byte
-        assert parse('bytes 100-100/*', 100) == 101
+        assert parse('bytes 100-100/101', 100) == 101
+        assert parse('bytes 100-100/*', 100) is None
+
+        # Tolerant: extra whitespace around delimiters
+        assert parse('bytes  100-199/200', 100) == 200
+        assert parse('bytes 100 - 199 / 200', 100) == 200
+        assert parse('  bytes 100-199/200  ', 100) == 200
+
+        # Tolerant: case-insensitive "bytes" prefix
+        assert parse('Bytes 100-199/200', 100) == 200
+        assert parse('BYTES 100-199/200', 100) == 200
+
+        # Partial range: server may return less than what's left
+        assert parse('bytes 100-149/200', 100) == 200
 
         # missing
         pytest.raises(ContentRangeError, parse, None, 100)
@@ -40,13 +53,13 @@ class TestDownloadUtils:
         # syntax error
         pytest.raises(ContentRangeError, parse, 'beers 100-199/*', 100)
 
-        # unexpected range
+        # unexpected range (first_byte_pos != resumed_from)
         pytest.raises(ContentRangeError, parse, 'bytes 100-199/*', 99)
 
-        # invalid instance-length
+        # invalid instance-length (instance_length <= last_byte_pos)
         pytest.raises(ContentRangeError, parse, 'bytes 100-199/199', 100)
 
-        # invalid byte-range-resp-spec
+        # invalid byte-range-resp-spec (first > last)
         pytest.raises(ContentRangeError, parse, 'bytes 100-99/199', 100)
 
     @pytest.mark.parametrize('header, expected_filename', [
@@ -83,19 +96,19 @@ class TestDownloadUtils:
         [
             # Simple
             ('foo.bar', 0, 'foo.bar'),
-            ('foo.bar', 1, 'foo.bar-1'),
-            ('foo.bar', 10, 'foo.bar-10'),
-            # Trim
+            ('foo.bar', 1, 'foo-1.bar'),
+            ('foo.bar', 10, 'foo-10.bar'),
+            # Trim (no extension)
             ('A' * 20, 0, 'A' * 10),
             ('A' * 20, 1, 'A' * 8 + '-1'),
             ('A' * 20, 10, 'A' * 7 + '-10'),
             # Trim before ext
             ('A' * 20 + '.txt', 0, 'A' * 6 + '.txt'),
-            ('A' * 20 + '.txt', 1, 'A' * 4 + '.txt-1'),
-            # Trim at the end
+            ('A' * 20 + '.txt', 1, 'A' * 4 + '-1.txt'),
+            # Trim at the end (long extension)
             ('foo.' + 'A' * 20, 0, 'foo.' + 'A' * 6),
-            ('foo.' + 'A' * 20, 1, 'foo.' + 'A' * 4 + '-1'),
-            ('foo.' + 'A' * 20, 10, 'foo.' + 'A' * 3 + '-10'),
+            ('foo.' + 'A' * 20, 1, 'foo-1.' + 'A' * 4),
+            ('foo.' + 'A' * 20, 10, 'foo-10.' + 'A' * 3),
         ]
     )
     @mock.patch('httpie.downloads.get_filename_max_length')
@@ -246,6 +259,52 @@ class TestDownloads:
                 )
                 downloader.chunk_downloaded(b'45')
                 downloader.finish()
+                assert not downloader.interrupted
+
+    def test_download_resumed_unknown_instance_length(self, mock_env, httpbin_both):
+        """Resume with Content-Range that uses '*' for instance-length.
+        total_size should be estimated from Content-Length + resumed_from."""
+        with tempfile.TemporaryDirectory() as tmp_dirname:
+            file = os.path.join(tmp_dirname, 'file.bin')
+
+            with open(file, 'wb') as fh:
+                fh.write(b'123')
+
+            with open(file, 'a+b') as output_file:
+                downloader = Downloader(mock_env, output_file=output_file, resume=True)
+                headers = {}
+                downloader.pre_request(headers)
+                assert headers['Range'] == 'bytes=3-'
+
+                downloader.start(
+                    final_response=Response(
+                        url=httpbin_both.url + '/',
+                        headers={
+                            'Content-Length': '2',
+                            'Content-Range': 'bytes 3-4/*',
+                        },
+                        status_code=PARTIAL_CONTENT
+                    ),
+                    initial_url='/'
+                )
+                # total_size = Content-Length(2) + resumed_from(3) = 5
+                assert downloader.status.total_size == 5
+                downloader.chunk_downloaded(b'45')
+                downloader.finish()
+                assert not downloader.interrupted
+
+    def test_download_interrupted_returns_bool(self, mock_env, httpbin_both):
+        """interrupted must return a strict bool, not a falsy like None or 0."""
+        with open(os.devnull, 'w') as devnull:
+            # No Content-Length → total_size is None → not interrupted
+            downloader = Downloader(mock_env, output_file=devnull)
+            downloader.start(
+                final_response=Response(url=httpbin_both.url + '/'),
+                initial_url='/'
+            )
+            downloader.chunk_downloaded(b'12345')
+            downloader.finish()
+            assert downloader.interrupted is False
 
     def test_download_with_redirect_original_url_used_for_filename(self, httpbin):
         # Redirect from `/redirect/1` to `/get`.

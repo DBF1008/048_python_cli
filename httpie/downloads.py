@@ -24,7 +24,9 @@ class ContentRangeError(ValueError):
     pass
 
 
-def parse_content_range(content_range: str, resumed_from: int) -> int:
+def parse_content_range(
+    content_range: str, resumed_from: int
+) -> Optional[int]:
     """
     Parse and validate Content-Range header.
 
@@ -33,17 +35,20 @@ def parse_content_range(content_range: str, resumed_from: int) -> int:
     :param content_range: the value of a Content-Range response header
                           eg. "bytes 21010-47021/47022"
     :param resumed_from: first byte pos. from the Range request header
-    :return: total size of the response body when fully downloaded.
+    :return: instance-length (total file size) when known, or ``None``
+             when the server sends ``*`` as instance-length.
 
     """
     if content_range is None:
         raise ContentRangeError('Missing Content-Range')
 
+    # Tolerate irregular spacing and case (some servers send "Bytes",
+    # extra whitespace around delimiters, etc.)
     pattern = (
-        r'^bytes (?P<first_byte_pos>\d+)-(?P<last_byte_pos>\d+)'
-        r'/(\*|(?P<instance_length>\d+))$'
+        r'^bytes\s+(?P<first_byte_pos>\d+)\s*-\s*(?P<last_byte_pos>\d+)'
+        r'\s*/\s*(\*|(?P<instance_length>\d+))$'
     )
-    match = re.match(pattern, content_range)
+    match = re.match(pattern, content_range.strip(), re.IGNORECASE)
 
     if not match:
         raise ContentRangeError(
@@ -70,16 +75,14 @@ def parse_content_range(content_range: str, resumed_from: int) -> int:
         raise ContentRangeError(
             f'Invalid Content-Range returned: {content_range!r}')
 
-    if (first_byte_pos != resumed_from
-        or (instance_length is not None
-            and last_byte_pos + 1 != instance_length)):
-        # Not what we asked for.
+    if first_byte_pos != resumed_from:
+        # The server started at a different offset than we asked for.
         raise ContentRangeError(
             f'Unexpected Content-Range returned ({content_range!r})'
             f' for the requested Range ("bytes={resumed_from}-")'
         )
 
-    return last_byte_pos + 1
+    return instance_length
 
 
 def filename_from_content_disposition(
@@ -128,7 +131,9 @@ def trim_filename(filename: str, max_len: int) -> str:
         trim_by = len(filename) - max_len
         name, ext = os.path.splitext(filename)
         if trim_by >= len(name):
-            filename = filename[:-trim_by]
+            # Name too short to absorb the trim; truncate from the end
+            # but always keep at least one character.
+            filename = filename[:max(max_len, 1)]
         else:
             filename = name[:-trim_by] + ext
     return filename
@@ -153,7 +158,11 @@ def get_unique_filename(filename: str, exists=os.path.exists) -> str:
     while True:
         suffix = f'-{attempt}' if attempt > 0 else ''
         try_filename = trim_filename_if_needed(filename, extra=len(suffix))
-        try_filename += suffix
+        if suffix:
+            # Insert the uniqueness suffix before the extension so that
+            # "report.pdf" becomes "report-1.pdf", not "report.pdf-1".
+            name, ext = os.path.splitext(try_filename)
+            try_filename = name + suffix + ext
         if not exists(try_filename):
             return try_filename
         attempt += 1
@@ -231,10 +240,17 @@ class Downloader:
         else:
             # `--output, -o` provided
             if self._resume and final_response.status_code == PARTIAL_CONTENT:
-                total_size = parse_content_range(
+                instance_length = parse_content_range(
                     final_response.headers.get('Content-Range'),
                     self._resumed_from
                 )
+                if instance_length is not None:
+                    total_size = instance_length
+                elif total_size is not None:
+                    # Server sent "*" for instance-length; estimate
+                    # total from Content-Length (= body size) + offset.
+                    total_size = total_size + self._resumed_from
+                # else: both unknown → total_size stays None (spinner)
 
             else:
                 self._resumed_from = 0
@@ -269,9 +285,9 @@ class Downloader:
 
     @property
     def interrupted(self) -> bool:
-        return (
+        return bool(
             self.finished
-            and self.status.total_size
+            and self.status.total_size is not None
             and self.status.total_size != self.status.downloaded
         )
 
